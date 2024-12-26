@@ -6,40 +6,126 @@ from skimage.restoration import denoise_tv_chambolle
 from skimage import exposure
 from scipy.signal import convolve2d
 
-app = Flask(__name__, static_folder='static', template_folder='static')
+app = Flask(__name__, static_folder='static', template_folder='templates')
 
 UPLOAD_FOLDER = 'uploads'
 RESULTS_FOLDER = 'results'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULTS_FOLDER, exist_ok=True)
 
-# FILTER 1: Refined Chest X-Ray Preprocessing
-# -------------------------------------
-def refined_preprocess_xray(image):
+import numpy as np
+
+
+# ----------------------------
+# 1. Custom CLAHE (Localized Contrast Enhancement)
+# ----------------------------
+def custom_clahe(image, clip_limit=40, grid_size=(8, 8)):
     """
-    Refined preprocessing of chest X-ray images using CLAHE, Gaussian Blur, and Adaptive Masking.
+    Custom CLAHE implementation for localized contrast enhancement.
     """
-    # Add the Original Image to Results
-    original_image = image.copy()
+    h, w = image.shape
+    tile_h, tile_w = h // grid_size[0], w // grid_size[1]
+    result = np.zeros_like(image)
 
-    # CLAHE for localized contrast enhancement
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    clahe_image = clahe.apply(image)
+    # Process each tile
+    for i in range(0, h, tile_h):
+        for j in range(0, w, tile_w):
+            # Extract tile
+            tile = image[i:i+tile_h, j:j+tile_w]
 
-    # Gaussian Blur
-    gaussian_blur = cv2.GaussianBlur(clahe_image, (3, 3), 0)
+            # Histogram computation
+            hist, bins = np.histogram(tile.flatten(), bins=256, range=[0, 256])
 
-    # Adaptive Masking with refined thresholding
+            # Clip histogram
+            excess = hist - clip_limit
+            excess[excess < 0] = 0
+            excess_total = np.sum(excess)
+            hist = np.clip(hist, 0, clip_limit)
+
+            # Redistribute excess
+            hist += excess_total // 256
+
+            # Compute CDF
+            cdf = hist.cumsum()
+            cdf_min = cdf.min()
+            cdf = (cdf - cdf_min) * 255 / (cdf.max() - cdf_min + 1e-5)  # Avoid div by zero
+            cdf = cdf.astype('uint8')
+
+            # Apply equalization
+            tile_equalized = cdf[tile]
+            result[i:i+tile_h, j:j+tile_w] = tile_equalized
+
+    return result
+
+
+# ----------------------------
+# 2. Custom Gaussian Blur
+# ----------------------------
+def custom_gaussian_blur(image, kernel_size=3, sigma=1.0):
+    """
+    Custom Gaussian Blur implementation.
+    """
+    # Create Gaussian kernel
+    k = kernel_size // 2
+    x, y = np.meshgrid(np.arange(-k, k+1), np.arange(-k, k+1))
+    kernel = np.exp(-(x**2 + y**2) / (2 * sigma**2))
+    kernel /= kernel.sum()  # Normalize kernel
+
+    # Apply convolution
+    padded_image = np.pad(image, k, mode='reflect')
+    output = np.zeros_like(image)
+
+    for i in range(image.shape[0]):
+        for j in range(image.shape[1]):
+            region = padded_image[i:i+kernel_size, j:j+kernel_size]
+            output[i, j] = np.sum(region * kernel)
+
+    return output
+
+
+# ----------------------------
+# 3. Custom Adaptive Masking
+# ----------------------------
+def custom_adaptive_masking(image):
+    """
+    Custom Adaptive Masking for highlight suppression.
+    """
+    # Calculate thresholds
     min_val, max_val = np.min(image), np.max(image)
     threshold = min_val + 0.95 * (max_val - min_val)  # Slightly less aggressive
-    _, mask = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-    adaptive_masking = cv2.bitwise_and(image, image, mask=~mask)
 
-    # Combine CLAHE + Gaussian Blur + Masking
-    combined = cv2.bitwise_and(gaussian_blur, gaussian_blur, mask=~mask)
+    # Generate binary mask
+    mask = np.where(image > threshold, 255, 0).astype('uint8')
 
-    # Return all results, including the original image
+    # Apply mask to suppress highlights
+    masked_image = image * (1 - mask // 255)
+
+    return masked_image
+
+
+# ----------------------------
+# 4. Filter 1: Refined Chest X-Ray Preprocessing
+# ----------------------------
+def refined_preprocess_xray(image):
+    """
+    Refined preprocessing of chest X-ray images using custom CLAHE, Gaussian Blur, and Adaptive Masking.
+    """
+    # 1. Original Image
+    original_image = image.copy()
+
+    # 2. CLAHE (Custom Implementation)
+    clahe_image = custom_clahe(image, clip_limit=40, grid_size=(8, 8))
+
+    # 3. Gaussian Blur (Custom Implementation)
+    gaussian_blur = custom_gaussian_blur(clahe_image, kernel_size=3, sigma=1.0)
+
+    # 4. Adaptive Masking (Custom Implementation)
+    adaptive_masking = custom_adaptive_masking(image)
+
+    # 5. Final Enhancement: Combine CLAHE + Gaussian + Masking
+    combined = gaussian_blur * (1 - adaptive_masking // 255)
+
+    # Return results
     return [
         ("Original Image", original_image),
         ("CLAHE", clahe_image),
@@ -85,7 +171,6 @@ def brain_mri_enhancement(image):
         ("Gamma Corrected", gamma_corrected)
     ]
 
-# --- FILTER 3: Skeleton Enhancement ---
 # --- FILTER 3: Skeleton Enhancement ---
 def skeleton_enhancement(image):
     """
@@ -165,6 +250,47 @@ def vessel_enhancement(image):
 ]
     return results
 
+
+from skimage.restoration import denoise_tv_chambolle, unsupervised_wiener, richardson_lucy
+from scipy.signal import convolve2d
+
+# --- FILTER 5: Brain Tumor Detection ---
+def brain_tumor_detection(image):
+    """
+    Apply Gaussian Blur, Total Variation Filtering, Wiener Filtering, and Lucy-Richardson Deconvolution
+    for Brain Tumor Detection.
+    """
+    # 1. Original Image
+    original = image.copy()
+
+    # 2. Gaussian Blur
+    gaussian_blur = cv2.GaussianBlur(image, (5, 5), 1)
+
+    # 3. Total Variation Filtering
+    tv_filtered = denoise_tv_chambolle(image / 255.0, weight=0.1)  # Normalize image
+    tv_filtered = (tv_filtered * 255).astype(np.uint8)  # Convert back to uint8
+
+    # 4. Wiener Filtering
+    psf = np.ones((5, 5)) / 25  # Point Spread Function
+    image_conv = convolve2d(image, psf, 'same')
+    wiener_filtered, _ = unsupervised_wiener(image_conv, psf)
+    wiener_filtered = np.clip(wiener_filtered, 0, 255).astype(np.uint8)  # Clip and convert to uint8
+
+    # 5. Lucy-Richardson Deconvolution
+    psf = np.ones((5, 5)) / 25  # Point Spread Function for Richardson-Lucy
+    lucy_richardson = richardson_lucy(image / 255.0, psf, num_iter=10)  # Deconvolution
+    lucy_richardson = (lucy_richardson * 255).astype(np.uint8)  # Convert back to uint8
+
+    # Return results
+    return [
+        ("Original Image", original),
+        ("Gaussian Blur", gaussian_blur),
+        ("Total Variation Filtering", tv_filtered),
+        ("Wiener Filtering", wiener_filtered),
+        ("Lucy-Richardson Deconvolution", lucy_richardson)
+    ]
+
+
 # --- Home Page ---
 @app.route('/', methods=['GET'])
 def home():
@@ -192,6 +318,9 @@ def process_image():
         results = skeleton_enhancement(image)
     elif filter_type == 'vessels':
         results = vessel_enhancement(image)
+    elif filter_type == 'brain_tumor_detection':
+        results = brain_tumor_detection(image)
+
     else:
         return jsonify({"error": "Invalid filter type."}), 400
 

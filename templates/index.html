@@ -39,6 +39,7 @@
                     <option value="brain_mri">Brain MRI Enhancement</option>
                     <option value="skeleton">Skeleton Enhancement</option>
                     <option value="vessels">Vessels Enhancement</option>
+                    <option value="brain_tumor_detection">Brain Tumor Detection</option> <!-- Added this option -->
                 </select>
             </div>
             <button type="submit" class="btn btn-primary">Process Image</button>
@@ -52,7 +53,7 @@
         document.getElementById('upload-form').addEventListener('submit', async function(e) {
             e.preventDefault();
             const formData = new FormData(this);
-            const response = await fetch('/', {
+            const response = await fetch('/process_image', {
                 method: 'POST',
                 body: formData
             });
