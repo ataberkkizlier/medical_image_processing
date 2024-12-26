@@ -14,62 +14,31 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULTS_FOLDER, exist_ok=True)
 
 import numpy as np
+import cv2
+
+import numpy as np
+import cv2
+
+# 1. Smooth CLAHE 
+def smooth_clahe(image, clip_limit=2.0, grid_size=(16, 16)):
+
+    # Apply CLAHE
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
+    equalized = clahe.apply(image)
+
+    # Smooth transitions with Gaussian blur
+    smooth = cv2.GaussianBlur(equalized, (7, 7), 1.5)
+
+    return smooth
 
 
-# ----------------------------
-# 1. Custom CLAHE (Localized Contrast Enhancement)
-# ----------------------------
-def custom_clahe(image, clip_limit=40, grid_size=(8, 8)):
-    """
-    Custom CLAHE implementation for localized contrast enhancement.
-    """
-    h, w = image.shape
-    tile_h, tile_w = h // grid_size[0], w // grid_size[1]
-    result = np.zeros_like(image)
+# 2. Smooth Gaussian Blur
+def smooth_gaussian_blur(image, kernel_size=7, sigma=1.5):
 
-    # Process each tile
-    for i in range(0, h, tile_h):
-        for j in range(0, w, tile_w):
-            # Extract tile
-            tile = image[i:i+tile_h, j:j+tile_w]
-
-            # Histogram computation
-            hist, bins = np.histogram(tile.flatten(), bins=256, range=[0, 256])
-
-            # Clip histogram
-            excess = hist - clip_limit
-            excess[excess < 0] = 0
-            excess_total = np.sum(excess)
-            hist = np.clip(hist, 0, clip_limit)
-
-            # Redistribute excess
-            hist += excess_total // 256
-
-            # Compute CDF
-            cdf = hist.cumsum()
-            cdf_min = cdf.min()
-            cdf = (cdf - cdf_min) * 255 / (cdf.max() - cdf_min + 1e-5)  # Avoid div by zero
-            cdf = cdf.astype('uint8')
-
-            # Apply equalization
-            tile_equalized = cdf[tile]
-            result[i:i+tile_h, j:j+tile_w] = tile_equalized
-
-    return result
-
-
-# ----------------------------
-# 2. Custom Gaussian Blur
-# ----------------------------
-def custom_gaussian_blur(image, kernel_size=3, sigma=1.0):
-    """
-    Custom Gaussian Blur implementation.
-    """
-    # Create Gaussian kernel
     k = kernel_size // 2
     x, y = np.meshgrid(np.arange(-k, k+1), np.arange(-k, k+1))
     kernel = np.exp(-(x**2 + y**2) / (2 * sigma**2))
-    kernel /= kernel.sum()  # Normalize kernel
+    kernel /= kernel.sum()
 
     # Apply convolution
     padded_image = np.pad(image, k, mode='reflect')
@@ -83,47 +52,57 @@ def custom_gaussian_blur(image, kernel_size=3, sigma=1.0):
     return output
 
 
-# ----------------------------
-# 3. Custom Adaptive Masking
-# ----------------------------
-def custom_adaptive_masking(image):
-    """
-    Custom Adaptive Masking for highlight suppression.
-    """
-    # Calculate thresholds
-    min_val, max_val = np.min(image), np.max(image)
-    threshold = min_val + 0.95 * (max_val - min_val)  # Slightly less aggressive
+# 3. Refined Adaptive Masking 
+def refined_adaptive_masking(image, threshold_factor=0.85):
 
-    # Generate binary mask
-    mask = np.where(image > threshold, 255, 0).astype('uint8')
+    # Normalize image to [0, 1]
+    normalized = image / 255.0
 
-    # Apply mask to suppress highlights
-    masked_image = image * (1 - mask // 255)
+    # Compute adaptive threshold based on intensity
+    mean_intensity = np.mean(normalized)
+    threshold = mean_intensity * threshold_factor
 
-    return masked_image
+    # Generate smooth mask
+    mask = cv2.GaussianBlur((normalized > threshold).astype(np.float32), (7, 7), 2)
+
+    # Suppress high-intensity regions
+    masked_image = normalized * (1 - mask)
+
+    # Rescale back to 8-bit
+    return (masked_image * 255).astype(np.uint8)
 
 
-# ----------------------------
-# 4. Filter 1: Refined Chest X-Ray Preprocessing
-# ----------------------------
+# 4. Final Enhancement
+
+def final_enhancement(image, clahe_image, adaptive_masking):
+
+    # Smoothly combine CLAHE and masking
+    combined = cv2.addWeighted(clahe_image, 0.8, adaptive_masking, 0.2, 0)
+
+    # Edge Enhancement using Laplacian filter
+    laplacian = cv2.Laplacian(combined, cv2.CV_64F)
+    enhanced_edges = cv2.addWeighted(combined, 1.0, np.uint8(np.abs(laplacian)), 0.5, 0)
+
+    return enhanced_edges
+
+
+# 5. Final Refined X-Ray Preprocessing Pipeline
 def refined_preprocess_xray(image):
-    """
-    Refined preprocessing of chest X-ray images using custom CLAHE, Gaussian Blur, and Adaptive Masking.
-    """
+
     # 1. Original Image
     original_image = image.copy()
 
-    # 2. CLAHE (Custom Implementation)
-    clahe_image = custom_clahe(image, clip_limit=40, grid_size=(8, 8))
+    # 2. Smooth CLAHE
+    clahe_image = smooth_clahe(image, clip_limit=2.0, grid_size=(16, 16))
 
-    # 3. Gaussian Blur (Custom Implementation)
-    gaussian_blur = custom_gaussian_blur(clahe_image, kernel_size=3, sigma=1.0)
+    # 3. Smooth Gaussian Blur
+    gaussian_blur = smooth_gaussian_blur(clahe_image, kernel_size=7, sigma=1.5)
 
-    # 4. Adaptive Masking (Custom Implementation)
-    adaptive_masking = custom_adaptive_masking(image)
+    # 4. Refined Adaptive Masking
+    adaptive_masking = refined_adaptive_masking(gaussian_blur, threshold_factor=0.85)
 
-    # 5. Final Enhancement: Combine CLAHE + Gaussian + Masking
-    combined = gaussian_blur * (1 - adaptive_masking // 255)
+    # 5. Final Enhanced Image
+    enhanced_image = final_enhancement(gaussian_blur, clahe_image, adaptive_masking)
 
     # Return results
     return [
@@ -131,38 +110,111 @@ def refined_preprocess_xray(image):
         ("CLAHE", clahe_image),
         ("Gaussian Blur", gaussian_blur),
         ("Adaptive Masking", adaptive_masking),
-        ("Final Enhanced", combined)
+        ("Final Enhanced", enhanced_image)
     ]
 
-# --- FILTER 2: Brain MRI Enhancement ---
+
+# FILTER 2: Brain MRI Enhancement
+import numpy as np
+import cv2
+
+# 1. Custom Anisotropic Diffusion
+def anisotropic_diffusion(img, num_iter=10, kappa=50, gamma=0.2):
+    img = img.astype('float32')
+    for _ in range(num_iter):
+        nabla_n = np.roll(img, -1, axis=0) - img  # North
+        nabla_s = np.roll(img, 1, axis=0) - img   # South
+        nabla_e = np.roll(img, -1, axis=1) - img  # East
+        nabla_w = np.roll(img, 1, axis=1) - img   # West
+
+        c_n = np.exp(-(nabla_n / kappa) ** 2)
+        c_s = np.exp(-(nabla_s / kappa) ** 2)
+        c_e = np.exp(-(nabla_e / kappa) ** 2)
+        c_w = np.exp(-(nabla_w / kappa) ** 2)
+
+        img += gamma * (
+            c_n * nabla_n + c_s * nabla_s + c_e * nabla_e + c_w * nabla_w
+        )
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 2. Smooth CLAHE 
+def smooth_clahe(image, clip_limit=2.0, grid_size=(16, 16)):
+    # Apply CLAHE
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
+    equalized = clahe.apply(image)
+
+    # Smooth transitions with Gaussian blur 
+    smooth = cv2.GaussianBlur(equalized, (7, 7), 1.5)
+
+    return smooth
+
+
+# 3. Smooth Gaussian Blur
+
+def smooth_gaussian_blur(image, kernel_size=7, sigma=1.5):
+    k = kernel_size // 2
+    x, y = np.meshgrid(np.arange(-k, k+1), np.arange(-k, k+1))
+    kernel = np.exp(-(x**2 + y**2) / (2 * sigma**2))
+    kernel /= kernel.sum()
+
+    padded_image = np.pad(image, k, mode='reflect')
+    output = np.zeros_like(image)
+
+    for i in range(image.shape[0]):
+        for j in range(image.shape[1]):
+            region = padded_image[i:i+kernel_size, j:j+kernel_size]
+            output[i, j] = np.sum(region * kernel)
+
+    return output
+
+
+
+# 4. Custom Gamma Correction
+
+def custom_gamma_correction(image, gamma=0.5):
+    inv_gamma = 1.0 / gamma
+    normalized = image / 255.0
+    gamma_corrected = np.power(normalized, inv_gamma) * 255
+    return gamma_corrected.astype(np.uint8)
+
+
+
+# 5. Custom Poisson Noise Simulation
+
+def poisson_noise(image):
+    vals = len(np.unique(image))
+    vals = 2 ** np.ceil(np.log2(vals))
+    noisy = np.random.poisson(image * vals) / float(vals)
+    return np.clip(noisy, 0, 255).astype(np.uint8)
+
+
+
+# 6. Final Brain MRI Enhancement 
+
 def brain_mri_enhancement(image):
-    # 1. Anisotropic Diffusion
-    def anisotropic_diffusion(img, num_iter=10, kappa=50, gamma=0.2):
-        img = img.astype('float32')
-        for _ in range(num_iter):
-            nabla = np.gradient(img)
-            c = np.exp(-(nabla[0]**2 + nabla[1]**2) / kappa**2)
-            img += gamma * np.sum([nabla[0] * c, nabla[1] * c], axis=0)
-        return np.clip(img, 0, 255).astype(np.uint8)
+    """
+    Custom Brain MRI enhancement pipeline with smooth filters and no grid artifacts.
+    """
 
-    anisotropic = anisotropic_diffusion(image)
+    # Step 1: Anisotropic Diffusion
+    anisotropic = anisotropic_diffusion(image, num_iter=10, kappa=50, gamma=0.2)
 
-    # 2. CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(anisotropic)
+    # Step 2: Smooth CLAHE 
+    clahe = smooth_clahe(anisotropic, clip_limit=2.0, grid_size=(16, 16))
 
-    # 3. Unsharp Masking (Edge Enhancement)
-    blurred = cv2.GaussianBlur(clahe, (5, 5), 0)
-    sharpened = cv2.addWeighted(clahe, 1.5, blurred, -0.5, 0)
+    # Step 3: Unsharp Masking 
+    blurred = smooth_gaussian_blur(clahe, kernel_size=7, sigma=1.5)
+    sharpened = np.clip(1.5 * clahe - 0.5 * blurred, 0, 255).astype(np.uint8)
 
-    # 4. Poisson Noise Simulation and Removal
-    poisson_noise = np.random.poisson(clahe / 255.0 * 255).astype('uint8')
-    poisson_denoised = denoise_tv_chambolle(poisson_noise / 255.0, weight=0.2)
-    poisson_denoised = (poisson_denoised * 255).astype(np.uint8)
+    # Step 4: Poisson Noise Simulation and Removal
+    poisson_noisy = poisson_noise(clahe)
+    poisson_denoised = anisotropic_diffusion(poisson_noisy, num_iter=5, kappa=50, gamma=0.1)
 
-    # 5. Gamma Correction
-    gamma_corrected = np.array(255 * (poisson_denoised / 255) ** 0.5, dtype='uint8')
+    # Step 5: Gamma Correction
+    gamma_corrected = custom_gamma_correction(poisson_denoised, gamma=0.7)
 
-    # Return results
+    # Return all results
     return [
         ("Anisotropic Diffusion", anisotropic),
         ("CLAHE", clahe),
@@ -171,7 +223,8 @@ def brain_mri_enhancement(image):
         ("Gamma Corrected", gamma_corrected)
     ]
 
-# --- FILTER 3: Skeleton Enhancement ---
+
+# FILTER 3: Skeleton Enhancement 
 def skeleton_enhancement(image):
     """
     Enhance skeleton images using Laplacian, Sobel, smoothing, masking, and gamma correction.
@@ -205,7 +258,7 @@ def skeleton_enhancement(image):
     # 8. Enhanced Image by Combining Features
     enhanced = cv2.addWeighted(image, 1.0, laplacian, 1.0, 0)
 
-    # Return all intermediate results
+    # Return all  results
     return [
         ("Original Image", original),
         ("Laplacian Image", laplacian),
@@ -218,48 +271,121 @@ def skeleton_enhancement(image):
     ]
 
 
-# --- FILTER 4: Vessel Enhancement ---
-import cv2
+# FILTER 4: Vessel Enhancement 
 import numpy as np
+import cv2
+
+
+# 1. CLAHE 
+
+def smooth_clahe(image, clip_limit=2.0, grid_size=(8, 8)):
+
+    # Apply CLAHE
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
+    result = clahe.apply(image)
+
+
+    return cv2.GaussianBlur(result, (3, 3), 0)
+
+
+
+# 2. Top-hat Preprocessing 
+
+def custom_top_hat(image, kernel_size=(15, 15)):
+  
+    image = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX)
+
+    # Use an adaptive kernel size
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel_size)
+
+    # Morphological transformation
+    background = cv2.morphologyEx(image, cv2.MORPH_CLOSE, kernel)
+    top_hat = cv2.subtract(image, background)
+
+    # Normalize output
+    top_hat = cv2.normalize(top_hat, None, 0, 255, cv2.NORM_MINMAX)
+
+    # Apply light smoothing to avoid noise spikes
+    return cv2.GaussianBlur(top_hat, (3, 3), 0)
+
+
+
+# 3. Gaussian Smoothing 
+
+def custom_gaussian_blur(image, kernel_size=5, sigma=1.0):
+    """
+    Custom Gaussian Blur implementation for artifact smoothing.
+    """
+    k = kernel_size // 2
+    x, y = np.meshgrid(np.arange(-k, k + 1), np.arange(-k, k + 1))
+    kernel = np.exp(-(x ** 2 + y ** 2) / (2 * sigma ** 2))
+    kernel /= kernel.sum()
+
+    # Apply convolution
+    padded_image = np.pad(image, k, mode='reflect')
+    output = np.zeros_like(image)
+
+    for i in range(image.shape[0]):
+        for j in range(image.shape[1]):
+            region = padded_image[i:i + kernel_size, j:j + kernel_size]
+            output[i, j] = np.sum(region * kernel)
+
+    return output
+
+
+# 4. Vessel Mask Extraction 
+
+def vessel_mask_extraction(image, top_hat):
+
+    # Combine CLAHE and Top-hat outputs
+    combined = cv2.addWeighted(image, 0.7, top_hat, 0.3, 0)
+
+    # Apply adaptive thresholding
+    mask = cv2.adaptiveThreshold(
+        combined, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 11, 2
+    )
+
+    # Apply final mask smoothing
+    mask = cv2.GaussianBlur(mask, (5, 5), 0)
+    return mask
+
+
+# 5. Final Vessel Enhancement Pipeline
 
 def vessel_enhancement(image):
-    # Check number of channels before converting to grayscale
-    if len(image.shape) == 3 and image.shape[2] == 3:  # RGB image
+
+    # Step 1: Convert to grayscale 
+    if len(image.shape) == 3 and image.shape[2] == 3:
         image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
-        image_gray = image  # Already grayscale
+        image_gray = image
 
-    # Proceed with preprocessing steps
-    # CLAHE preprocessing
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    clahe_image = clahe.apply(image_gray)
+    # Step 2: CLAHE preprocessing
+    clahe_image = smooth_clahe(image_gray, clip_limit=2.0, grid_size=(8, 8))
 
-    # Top-hat preprocessing
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    top_hat_image = cv2.morphologyEx(image_gray, cv2.MORPH_TOPHAT, kernel)
+    # Step 3: Top-hat preprocessing
+    top_hat_image = custom_top_hat(image_gray, kernel_size=(15, 15))
 
-    # Apply smoothing (RGF or other methods)
-    smooth_image = cv2.GaussianBlur(clahe_image, (5, 5), 0)
+    # Step 4: Gaussian smoothing
+    smooth_image = custom_gaussian_blur(clahe_image, kernel_size=5, sigma=1.0)
 
-    # Combine all steps and return results
-    results = [
-    ('Original Image', image_gray),
-    ('Top-hat Preprocessing', top_hat_image),
-    ('CLAHE Preprocessing', clahe_image),
-    ('RGF Smoothing', smooth_image)
-]
-    return results
+    # Step 5: Vessel Mask Extraction
+    vessel_mask = vessel_mask_extraction(clahe_image, top_hat_image)
+
+    # Return results
+    return [
+        ('Original Image', image_gray),
+        ('Top-hat Preprocessing', top_hat_image),
+        ('CLAHE Preprocessing', clahe_image),
+        ('Gaussian Smoothing', smooth_image),
+        ('Vessel Mask', vessel_mask)
+    ]
 
 
-from skimage.restoration import denoise_tv_chambolle, unsupervised_wiener, richardson_lucy
-from scipy.signal import convolve2d
-
-# --- FILTER 5: Brain Tumor Detection ---
+# FILTER 5: Brain Tumor Detection 
 def brain_tumor_detection(image):
-    """
-    Apply Gaussian Blur, Total Variation Filtering, Wiener Filtering, and Lucy-Richardson Deconvolution
-    for Brain Tumor Detection.
-    """
+
     # 1. Original Image
     original = image.copy()
 
@@ -267,8 +393,8 @@ def brain_tumor_detection(image):
     gaussian_blur = cv2.GaussianBlur(image, (5, 5), 1)
 
     # 3. Total Variation Filtering
-    tv_filtered = denoise_tv_chambolle(image / 255.0, weight=0.1)  # Normalize image
-    tv_filtered = (tv_filtered * 255).astype(np.uint8)  # Convert back to uint8
+    tv_filtered = denoise_tv_chambolle(image / 255.0, weight=0.1)  
+    tv_filtered = (tv_filtered * 255).astype(np.uint8)  
 
     # 4. Wiener Filtering
     psf = np.ones((5, 5)) / 25  # Point Spread Function
